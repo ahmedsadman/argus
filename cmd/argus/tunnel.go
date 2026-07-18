@@ -103,12 +103,24 @@ func resolveTunnel(o tunnelOptions) (tunnel.Provider, string, error) {
 		if cfMode == "quick" && cfLog != "debug" {
 			cfLog = "info"
 		}
+		// Populate CredsDir only for local mode so Prepare can fail fast if the
+		// tunnel is registered remotely but its <UUID>.json is absent locally.
+		// Derived from the same cert path cloudflared itself uses.
+		var credsDir string
+		if cfMode == "local" {
+			cert, _, err := cloudflareCertPath()
+			if err != nil {
+				return nil, "", err
+			}
+			credsDir = filepath.Dir(cert)
+		}
 		return tunnel.Cloudflare{
 			Bin:      bin,
 			Token:    o.cfToken,
 			Tunnel:   name,
 			Hostname: o.cfHostname,
 			LogLevel: cfLog,
+			CredsDir: credsDir,
 		}, origin, nil
 	default:
 		// unreachable: providerBinary already gated unknown names

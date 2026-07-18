@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -29,6 +31,8 @@ type Cloudflare struct {
 	Tunnel   string // locally-managed tunnel name (selects local mode)
 	Hostname string // public hostname argus routes to the locally-managed tunnel
 	LogLevel string // cloudflared --loglevel (debug/info/warn/error/fatal); "" omits it
+	CredsDir string // directory where cloudflared reads tunnel credentials (<UUID>.json);
+	// empty => skip the local-credentials check in Prepare (used by tests).
 
 	runner cmdRunner // nil => defaultRunner (real exec); overridable in tests
 }
@@ -98,7 +102,7 @@ func (c Cloudflare) Prepare(ctx context.Context) (string, error) {
 		return "", nil
 	}
 
-	exists, err := c.tunnelExists(ctx)
+	exists, id, err := c.tunnelExists(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -106,6 +110,8 @@ func (c Cloudflare) Prepare(ctx context.Context) (string, error) {
 		if _, stderr, err := c.exec(ctx, c.tunnelArgs("create", c.Tunnel)...); err != nil {
 			return "", fmt.Errorf("create tunnel %q: %w: %s", c.Tunnel, err, bytes.TrimSpace(stderr))
 		}
+	} else if err := c.checkCredentials(id); err != nil {
+		return "", err
 	}
 
 	// --overwrite-dns makes the route idempotent across restarts.
@@ -116,25 +122,52 @@ func (c Cloudflare) Prepare(ctx context.Context) (string, error) {
 	return "https://" + c.Hostname, nil
 }
 
-// tunnelExists reports whether a tunnel named c.Tunnel exists, by parsing
-// `cloudflared tunnel list --output json`.
-func (c Cloudflare) tunnelExists(ctx context.Context) (bool, error) {
+// tunnelExists reports whether a tunnel named c.Tunnel exists, and returns its
+// UUID when it does, by parsing `cloudflared tunnel list --output json`.
+func (c Cloudflare) tunnelExists(ctx context.Context) (bool, string, error) {
 	stdout, stderr, err := c.exec(ctx, c.tunnelArgs("list", "--output", "json")...)
 	if err != nil {
-		return false, fmt.Errorf("list tunnels: %w: %s", err, bytes.TrimSpace(stderr))
+		return false, "", fmt.Errorf("list tunnels: %w: %s", err, bytes.TrimSpace(stderr))
 	}
 	var tunnels []struct {
+		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
 	if err := json.Unmarshal(stdout, &tunnels); err != nil {
-		return false, fmt.Errorf("parse tunnel list: %w", err)
+		return false, "", fmt.Errorf("parse tunnel list: %w", err)
 	}
 	for _, t := range tunnels {
 		if t.Name == c.Tunnel {
-			return true, nil
+			return true, t.ID, nil
 		}
 	}
-	return false, nil
+	return false, "", nil
+}
+
+// checkCredentials fails fast when the tunnel is registered on the account but
+// its <UUID>.json (only written by `tunnel create` on the origin machine) is
+// absent here — otherwise cloudflared restart-loops on "credentials file not
+// found". Resolution mirrors cloudflared: $TUNNEL_CRED_FILE else <CredsDir>/<UUID>.json.
+// Empty CredsDir skips the check.
+func (c Cloudflare) checkCredentials(id string) error {
+	if c.CredsDir == "" || id == "" {
+		return nil
+	}
+	path := os.Getenv("TUNNEL_CRED_FILE")
+	if path == "" {
+		path = filepath.Join(c.CredsDir, id+".json")
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat cloudflared credentials %s: %w", path, err)
+	}
+	return fmt.Errorf(
+		"cloudflare tunnel %q (UUID %s) is registered on the account but its credentials file %s is missing on this machine. "+
+			"Copy the credentials JSON from the machine that originally ran `cloudflared tunnel create`, "+
+			"or run `cloudflared tunnel delete %s` and restart argus to recreate it",
+		c.Tunnel, id, path, c.Tunnel,
+	)
 }
 
 // tunnelArgs builds args for a `cloudflared tunnel <sub...>` call. cloudflared
